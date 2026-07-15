@@ -50,7 +50,10 @@ DOMAIN="${STARFALL_DOMAIN:-}"
 info()  { printf '\033[1;36m[starfall]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[starfall]\033[0m %s\n' "$*"; }
 error() { printf '\033[1;31m[starfall]\033[0m %s\n' "$*" >&2; }
-rand_pw() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-20}"; }
+# Subshell met 'set +o pipefail': head sluit de pipe na N tekens, waardoor tr
+# een SIGPIPE krijgt. Zonder deze isolatie zou die "mislukte" pipe via het
+# hierboven gezette 'set -o pipefail' + 'set -e' het script afbreken.
+rand_pw() { ( set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-20}" ); }
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -105,15 +108,22 @@ install_prerequisites() {
 }
 
 find_free_port() {
-  local port="$1"
-  while :; do
-    if ss -ltn 2>/dev/null | grep -q ":${port}[[:space:]]" \
-       || docker ps --format '{{.Ports}}' 2>/dev/null | grep -q ":${port}->"; then
-      port=$((port + 1))
-    else
-      echo "$port"; return
-    fi
-  done
+  # Hele detectie in een subshell met 'set +o pipefail': anders kan een
+  # grep -q (die de pipe vroeg sluit -> SIGPIPE upstream) de pipeline op
+  # non-zero zetten, waardoor een BEZETTE poort als vrij wordt gezien.
+  ( set +o pipefail
+    local port="$1"
+    while :; do
+      # Bezet als iets op de host op deze poort luistert (IPv4 én IPv6),
+      # of als een Docker-container de poort al publiceert.
+      if ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$" \
+         || docker ps --format '{{.Ports}}' 2>/dev/null | grep -qE "(^|[^0-9])${port}->"; then
+        port=$((port + 1))
+      else
+        echo "$port"; return
+      fi
+    done
+  )
 }
 
 clone_or_update() {
